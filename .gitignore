@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+work/
+output/
+dist/
+build/
+release/
+release-check/
+third_party/
+*.spec
+*.mp4
+*.restoration.json
+*.log
+

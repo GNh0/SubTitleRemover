@@ -406,6 +406,53 @@ def load_strategy_map(path: Path | None, fps: float, total: int,
     return default, spans
 
 
+def load_mask_map(path: Path | None, fps: float, total: int,
+                  width: int, height: int) -> list[tuple[int, int, list[Box]]]:
+    """Load frame-aligned boxes that supplement OCR where a caption was missed."""
+    if path is None:
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        raise ValueError("Mask map must contain a segments array")
+    spans = []
+    for entry in data["segments"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("boxes"), list):
+            raise ValueError("Every mask segment needs a boxes array")
+        start, end = entry.get("start"), entry.get("end")
+        if (not isinstance(start, (int, float)) or isinstance(start, bool)
+                or not isinstance(end, (int, float)) or isinstance(end, bool)
+                or not math.isfinite(start) or not math.isfinite(end)):
+            raise ValueError("Mask segment times must be finite numbers")
+        first, last = round(start * fps), round(end * fps)
+        if not 0 <= first < last <= total:
+            raise ValueError("Mask segment is outside the video or empty")
+        boxes = []
+        for coordinates in entry["boxes"]:
+            if (not isinstance(coordinates, list) or len(coordinates) != 4
+                    or any(not isinstance(value, int) or isinstance(value, bool)
+                           for value in coordinates)):
+                raise ValueError("Mask boxes need four integer coordinates")
+            left, top, right, bottom = coordinates
+            if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+                raise ValueError("Mask box is outside the video or empty")
+            boxes.append((left, top, right, bottom))
+        if not boxes:
+            raise ValueError("Mask segment must contain at least one box")
+        spans.append((first, last, boxes))
+    return spans
+
+
+def supplement_boxes(information: list[FrameInfo], scan_start: int,
+                     spans: list[tuple[int, int, list[Box]]]) -> None:
+    """Add only the specified frames to the caption mask and reference exclusion."""
+    scan_end = scan_start + len(information)
+    for first, last, boxes in spans:
+        for absolute in range(max(first, scan_start), min(last, scan_end)):
+            item = information[absolute - scan_start]
+            item.boxes.extend(boxes)
+            item.clean = False
+
+
 def strategy_for_frame(index: int, default: str,
                        spans: list[tuple[int, int, str]]) -> str:
     for first, last, method in spans:
@@ -510,9 +557,12 @@ def run_job(args: argparse.Namespace) -> dict:
     capture = cv2.VideoCapture(str(source))
     fps = float(capture.get(cv2.CAP_PROP_FPS))
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     capture.release()
     if fps <= 0 or total < 2:
         raise ValueError("Input has no valid frame rate or frame count")
+    mask_spans = load_mask_map(args.mask_map, fps, total, width, height)
     default_method, strategy_spans = load_strategy_map(
         args.strategy_map, fps, total,
         "gpu" if args.big_lama_python else "cpu")
@@ -533,6 +583,7 @@ def run_job(args: argparse.Namespace) -> dict:
     frames, information, measured_fps = detect_and_cache(
         source, work, scan_start, scan_end, args.band_start,
         args.scene_threshold)
+    supplement_boxes(information, scan_start, mask_spans)
     if abs(measured_fps - fps) > 0.01:
         raise RuntimeError("Video frame rate changed during scan")
     selected_start, selected_end = start - scan_start, end - scan_start
@@ -766,6 +817,8 @@ def main() -> int:
                         help="Local big-lama.pt used by the CUDA worker")
     parser.add_argument("--strategy-map", type=Path,
                         help="JSON with default cpu/gpu and non-overlapping time spans")
+    parser.add_argument("--mask-map", type=Path,
+                        help="JSON with timed pixel boxes to supplement missed OCR captions")
     args = parser.parse_args()
     if bool(args.big_lama_python) != bool(args.big_lama_model):
         parser.error("Provide both --big-lama-python and --big-lama-model")
@@ -774,6 +827,8 @@ def main() -> int:
         args.big_lama_model = args.big_lama_model.resolve(strict=True)
     if args.strategy_map:
         args.strategy_map = args.strategy_map.resolve(strict=True)
+    if args.mask_map:
+        args.mask_map = args.mask_map.resolve(strict=True)
     logging.getLogger("RapidOCR").setLevel(logging.ERROR)
     automatic_work = args.work is None
     if automatic_work:

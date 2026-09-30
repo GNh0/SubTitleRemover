@@ -10,9 +10,10 @@ import numpy as np
 import remove_subtitles
 from remove_subtitles import (BigLamaWorker, FrameInfo, blend, box_mask, candidate_quality,
                               expanded_refinement_mask, frame_boxes, glyph_mask,
-                              load_strategy_map, pick_reference,
+                              load_mask_map, load_strategy_map, pick_reference,
                               pick_restored_reference, residual_ratio,
-                              restoration_mask, strategy_for_frame)
+                              restoration_mask, strategy_for_frame,
+                              supplement_boxes)
 
 
 class SubtitleRestorationTests(unittest.TestCase):
@@ -214,6 +215,29 @@ while header := stream.read(8):
             ]}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "overlap"):
                 load_strategy_map(path, 15, 150, "cpu")
+
+    def test_mask_map_supplements_only_requested_frames(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "masks.json"
+            path.write_text(json.dumps({"segments": [{
+                "start": 2, "end": 3,
+                "boxes": [[25, 25, 75, 40]]
+            }]}), encoding="utf-8")
+            spans = load_mask_map(path, 15, 90, 100, 50)
+            self.assertEqual(spans, [(30, 45, [(25, 25, 75, 40)])])
+            image = np.zeros((4, 4, 3), np.uint8)
+            information = [FrameInfo([], 0, image, True) for _ in range(5)]
+            supplement_boxes(information, 28, spans)
+            self.assertEqual([bool(item.boxes) for item in information],
+                             [False, False, True, True, True])
+            self.assertEqual([item.clean for item in information],
+                             [True, True, False, False, False])
+            path.write_text(json.dumps({"segments": [{
+                "start": 2, "end": 3,
+                "boxes": [[25, 25, 125, 40]]
+            }]}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outside"):
+                load_mask_map(path, 15, 90, 100, 50)
 
 
 if __name__ == "__main__":
